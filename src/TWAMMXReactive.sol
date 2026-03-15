@@ -1,29 +1,21 @@
 // SPDX-License-Identifier: MIT
 pragma solidity >=0.8.0;
 
-import {IReactive, AbstractReactive} from "reactive-lib/abstract-base/AbstractReactive.sol";
+import {IReactive} from "reactive-lib/interfaces/IReactive.sol";
+import {AbstractReactive} from "reactive-lib/abstract-base/AbstractReactive.sol";
 
 /// @title TWAMMXReactive
-/// @notice Reactive Contract that monitors TWAMM-X hook events and automatically
-///         triggers LP rebate distribution after every batch execution.
+/// @notice Reactive Contract deployed on Reactive Network.
+///         Watches TWAMMXHook.BatchExecuted events on the origin chain and
+///         automatically calls hook.reactiveDistributeRebate(poolId) via callback —
+///         no off-chain keeper required.
 ///
-/// Deployment:
-///   1. Deploy TWAMMXHook + TWAMMSettlement on origin chain (e.g. Ethereum mainnet).
-///   2. Deploy this contract on Reactive Network, passing:
-///      - originChainId   : chain ID where TWAMMXHook is deployed
-///      - hook            : TWAMMXHook address on origin chain
-///      - destinationChainId : same as originChainId (callback goes back to same chain)
-///      - callbackProxy   : Reactive callback proxy address for origin chain
-///
-/// Behaviour:
-///   - Subscribes to TWAMMXHook.BatchExecuted events on the origin chain.
-///   - On each BatchExecuted, emits a Callback that calls
-///     TWAMMXHook.distributeLPRebate(poolId) on the origin chain.
-///   - Subscribes to TWAMMXHook.OrderCommitted events and emits a Callback
-///     to call TWAMMXHook.distributeLPRebate after the order's expiry
-///     (best-effort: fires on next BatchExecuted after expiry).
-///
-/// This eliminates the need for any off-chain keeper to distribute LP rebates.
+/// Deploy on Reactive Network:
+///   forge create src/TWAMMXReactive.sol:TWAMMXReactive \
+///     --rpc-url $REACTIVE_RPC_URL \
+///     --private-key $REACTIVE_PRIVATE_KEY \
+///     --value 0.01ether \
+///     --constructor-args $ORIGIN_CHAIN_ID $HOOK_ADDR $ORIGIN_CHAIN_ID $CALLBACK_PROXY
 contract TWAMMXReactive is IReactive, AbstractReactive {
 
     // -----------------------------------------------------------------------
@@ -33,35 +25,47 @@ contract TWAMMXReactive is IReactive, AbstractReactive {
     uint64 private constant CALLBACK_GAS_LIMIT = 500_000;
 
     /// @dev keccak256("BatchExecuted(bytes32,uint128,uint128,uint256)")
+    /// PoolId is bytes32 under the hood; non-indexed params are uint128,uint128,uint256
     uint256 private constant BATCH_EXECUTED_TOPIC =
-        0x4d6ce1e535dbade1c23defba91e23b8f791ce5edc0cc320dae6d0e6054b9e8b4;
+        0x83b566dca93fe71a74ddaebf58cb9c5b1700ed3be921ac3e7892ef36e668a8fc;
 
     // -----------------------------------------------------------------------
-    // State (ReactVM instance only)
+    // State
     // -----------------------------------------------------------------------
 
     uint256 private immutable originChainId;
     uint256 private immutable destinationChainId;
     address private immutable hook;
-    address private immutable callbackProxy;
 
     // -----------------------------------------------------------------------
     // Constructor
     // -----------------------------------------------------------------------
 
+    /// @param _originChainId      Chain ID where TWAMMXHook is deployed.
+    /// @param _hook               TWAMMXHook address on the origin chain.
+    /// @param _destinationChainId Chain ID to send callbacks to (same as origin).
+    /// @param _callbackProxy      Reactive callback proxy for the destination chain
+    ///                            (passed to AbstractReactive via service subscription).
     constructor(
         uint256 _originChainId,
         address _hook,
         uint256 _destinationChainId,
-        address _callbackProxy
+        address _callbackProxy  // used by Reactive Network infrastructure, not stored
     ) payable {
+        // AbstractReactive constructor runs detectVm(), sets service + vendor
+        // This is called implicitly via Solidity's constructor chaining.
+
         originChainId      = _originChainId;
         hook               = _hook;
         destinationChainId = _destinationChainId;
-        callbackProxy      = _callbackProxy;
 
-        // Subscribe to BatchExecuted events on the origin chain hook
-        // Only subscribe when running on Reactive Network (not ReactVM)
+        // Suppress unused variable warning — callbackProxy is a deployment param
+        // consumed by Reactive Network's infrastructure, not needed in contract logic.
+        (_callbackProxy);
+
+        // Subscribe to BatchExecuted events on the origin chain.
+        // Guard with !vm: on Reactive Network (RN) we subscribe;
+        // on ReactVM we skip (ReactVM can't call service.subscribe).
         if (!vm) {
             service.subscribe(
                 _originChainId,
@@ -78,26 +82,28 @@ contract TWAMMXReactive is IReactive, AbstractReactive {
     // IReactive — event processing (ReactVM only)
     // -----------------------------------------------------------------------
 
-    /// @notice Called by Reactive Network whenever a subscribed event fires.
-    ///         Decodes the BatchExecuted log and triggers distributeLPRebate
-    ///         on the origin chain via a cross-chain callback.
+    /// @notice Called by Reactive Network on every subscribed event.
+    ///         Fires a callback to hook.reactiveDistributeRebate(poolId)
+    ///         on the origin chain.
     function react(LogRecord calldata log) external vmOnly {
+        // Defensive checks — only process our specific event
         if (
-            log.chain_id == originChainId &&
-            log._contract == hook &&
-            log.topic_0 == BATCH_EXECUTED_TOPIC
-        ) {
-            // topic_1 = poolId (indexed)
-            bytes32 poolId = bytes32(log.topic_1);
+            log.chain_id  != originChainId  ||
+            log._contract != hook           ||
+            log.topic_0   != BATCH_EXECUTED_TOPIC
+        ) return;
 
-            // Encode callback: reactiveDistributeRebate(poolId)
-            // Reactive Network replaces address(0) with the ReactVM ID automatically
-            bytes memory payload = abi.encodeWithSignature(
-                "reactiveDistributeRebate(bytes32)",
-                poolId
-            );
+        // topic_1 = poolId (first indexed param of BatchExecuted)
+        bytes32 poolId = bytes32(log.topic_1);
 
-            emit Callback(destinationChainId, hook, CALLBACK_GAS_LIMIT, payload);
-        }
+        // Build callback payload.
+        // Reactive Network automatically replaces the first 160 bits (address(0))
+        // with the ReactVM ID before submitting the tx to the destination chain.
+        bytes memory payload = abi.encodeWithSignature(
+            "reactiveDistributeRebate(bytes32)",
+            poolId
+        );
+
+        emit Callback(destinationChainId, hook, CALLBACK_GAS_LIMIT, payload);
     }
 }

@@ -12,6 +12,8 @@ remappings = [
     "@uniswap/v4-periphery/=lib/v4-periphery/src/",
     "forge-std/=lib/forge-std/src/",
     "reactive-lib/=lib/reactive-lib/src/",
+    "@fhenixprotocol/cofhe-contracts/=lib/cofhe-contracts/contracts/",
+    "@openzeppelin/contracts/=lib/v4-core/lib/openzeppelin-contracts/contracts/",
 ]
 
 [profile.default.fuzz]

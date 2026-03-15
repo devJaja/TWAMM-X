@@ -1,0 +1,8 @@
+cache/
+out/
+circuits/node_modules/
+circuits/witness.wtns
+circuits/pot12_0000.ptau
+circuits/pot12_0001.ptau
+circuits/order_commit_0000.zkey
+.env

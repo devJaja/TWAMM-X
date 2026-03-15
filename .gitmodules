@@ -1,3 +1,6 @@
 [submodule "lib/reactive-lib"]
 	path = lib/reactive-lib
 	url = https://github.com/Reactive-Network/reactive-lib
+[submodule "lib/cofhe-contracts"]
+	path = lib/cofhe-contracts
+	url = https://github.com/FhenixProtocol/cofhe-contracts
