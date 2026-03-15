@@ -406,10 +406,10 @@ contract TWAMMXHookTest is Test {
     }
 
     // -----------------------------------------------------------------------
-    // 15. distributeLPRebate donates to pool and resets accrual
+    // 15. distributeLPRebate starts a smoothing epoch
     // -----------------------------------------------------------------------
     function test_distributeLPRebate() public {
-        // Accrue some rebate via swap
+        // Accrue rebate via swap
         router.swap(key, SwapParams({
             zeroForOne:        true,
             amountSpecified:   -10_000e18,
@@ -419,12 +419,11 @@ contract TWAMMXHookTest is Test {
         (uint256 r0Before,) = hook.lpRebateAccrued(poolId);
         assertGt(r0Before, 0);
 
-        // Fund the hook with enough tokens to donate and approve poolManager
         token0.mint(address(hook), r0Before);
         vm.prank(address(hook));
         token0.approve(address(poolManager), type(uint256).max);
 
-        // Do another swap to move price into the seeded tick range so liquidity is in-range
+        // Move price back in range
         router.swap(key, SwapParams({
             zeroForOne:        false,
             amountSpecified:   -1e18,
@@ -433,12 +432,87 @@ contract TWAMMXHookTest is Test {
 
         hook.distributeLPRebate(poolId);
 
+        // Rebate cleared from accrual
         (uint256 r0After,) = hook.lpRebateAccrued(poolId);
-        assertEq(r0After, 0, "rebate should be zeroed after distribution");
+        assertEq(r0After, 0);
+
+        // Epoch started — vested yield at t=0 is 0 (nothing elapsed yet)
+        (uint256 v0,) = hook.vestedYield(poolId);
+        assertEq(v0, 0);
     }
 
     // -----------------------------------------------------------------------
-    // 16. distributeLPRebate with nothing accrued reverts
+    // 16. vestedYield increases linearly over SMOOTHING_WINDOW
+    // -----------------------------------------------------------------------
+    function test_yieldSmoothing_linearRelease() public {
+        // Accrue and start epoch
+        router.swap(key, SwapParams({
+            zeroForOne:        true,
+            amountSpecified:   -10_000e18,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        }), "");
+
+        (uint256 total0,) = hook.lpRebateAccrued(poolId);
+        token0.mint(address(hook), total0);
+        vm.prank(address(hook));
+        token0.approve(address(poolManager), type(uint256).max);
+
+        router.swap(key, SwapParams({
+            zeroForOne: false, amountSpecified: -1e18,
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        }), "");
+
+        hook.distributeLPRebate(poolId);
+
+        // At 50% of window → 50% vested
+        vm.warp(block.timestamp + hook.SMOOTHING_WINDOW() / 2);
+        (uint256 v0half,) = hook.vestedYield(poolId);
+        assertApproxEqRel(v0half, total0 / 2, 0.01e18); // within 1%
+
+        // At 100% of window → 100% vested
+        vm.warp(block.timestamp + hook.SMOOTHING_WINDOW() / 2);
+        (uint256 v0full,) = hook.vestedYield(poolId);
+        assertApproxEqRel(v0full, total0, 0.01e18);
+    }
+
+    // -----------------------------------------------------------------------
+    // 17. releaseYield donates only the vested portion
+    // -----------------------------------------------------------------------
+    function test_releaseYield_partialRelease() public {
+        router.swap(key, SwapParams({
+            zeroForOne:        true,
+            amountSpecified:   -10_000e18,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        }), "");
+
+        (uint256 total0,) = hook.lpRebateAccrued(poolId);
+        token0.mint(address(hook), total0);
+        vm.prank(address(hook));
+        token0.approve(address(poolManager), type(uint256).max);
+
+        router.swap(key, SwapParams({
+            zeroForOne: false, amountSpecified: -1e18,
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        }), "");
+
+        hook.distributeLPRebate(poolId);
+
+        // Warp to 25% of window
+        vm.warp(block.timestamp + hook.SMOOTHING_WINDOW() / 4);
+
+        (uint256 vested0,) = hook.vestedYield(poolId);
+        assertGt(vested0, 0);
+
+        // Release vested portion
+        hook.releaseYield(poolId);
+
+        // After release, vested should be 0 (just released)
+        (uint256 vestedAfter,) = hook.vestedYield(poolId);
+        assertEq(vestedAfter, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // 18. distributeLPRebate with nothing accrued reverts
     // -----------------------------------------------------------------------
     function test_distributeLPRebate_nothingToDistribute() public {
         vm.expectRevert(ITWAMMXHook.NothingToDistribute.selector);

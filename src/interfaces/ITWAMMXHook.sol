@@ -58,6 +58,14 @@ interface ITWAMMXHook {
         uint256         amount1
     );
 
+    /// @notice Emitted on each smoothed yield release to LPs.
+    event YieldReleased(
+        PoolId  indexed poolId,
+        uint256         amount0,
+        uint256         amount1,
+        uint256         epochProgress
+    );
+
     // -----------------------------------------------------------------------
     // Errors
     // -----------------------------------------------------------------------
@@ -106,7 +114,14 @@ interface ITWAMMXHook {
     function cancelOrder(PoolId poolId, bytes32 commitmentId) external;
 
     /// @notice Distribute accrued LP rebates back to the pool via donation.
+    ///         Starts a new 24h smoothing epoch — yield is released linearly.
     function distributeLPRebate(PoolId poolId) external;
+
+    /// @notice Release the currently vested portion of smoothed yield to LPs.
+    function releaseYield(PoolId poolId) external;
+
+    /// @notice Returns the currently releasable (vested but not yet donated) yield.
+    function vestedYield(PoolId poolId) external view returns (uint256 amount0, uint256 amount1);
 
     // -----------------------------------------------------------------------
     // Views

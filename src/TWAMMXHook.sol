@@ -74,9 +74,26 @@ contract TWAMMXHook is ITWAMMXHook, IHooks, IUnlockCallback {
     mapping(PoolId => uint128) private _pendingSell0;
     mapping(PoolId => uint128) private _pendingSell1;
 
-    /// @dev Accrued LP rebates (token0, token1) per pool
+    /// @dev Accrued LP rebates (token0, token1) per pool — total pending in current epoch
     mapping(PoolId => uint256) private _rebate0;
     mapping(PoolId => uint256) private _rebate1;
+
+    // -----------------------------------------------------------------------
+    // Fee-smoothing state
+    // -----------------------------------------------------------------------
+
+    /// @notice Duration over which each rebate epoch is linearly released to LPs.
+    ///         Default: 24 hours. Yields predictable, continuous LP income.
+    uint64 public constant SMOOTHING_WINDOW = 24 hours;
+
+    /// @dev Epoch start timestamp per pool — when the current rebate epoch began
+    mapping(PoolId => uint64)  private _epochStart;
+    /// @dev Total rebate committed at epoch start (token0, token1)
+    mapping(PoolId => uint256) private _epochTotal0;
+    mapping(PoolId => uint256) private _epochTotal1;
+    /// @dev Amount already donated in current epoch (token0, token1)
+    mapping(PoolId => uint256) private _epochDonated0;
+    mapping(PoolId => uint256) private _epochDonated1;
 
     /// @dev Timestamp of last TWAMM batch execution per pool
     mapping(PoolId => uint64) private _lastExecution;
@@ -246,21 +263,83 @@ contract TWAMMXHook is ITWAMMXHook, IHooks, IUnlockCallback {
         uint256 r1 = _rebate1[poolId];
         if (r0 == 0 && r1 == 0) revert NothingToDistribute();
 
-        PoolKey memory key = _poolKeys[poolId];
-
         // Only donate if there is in-range liquidity to receive fees
         if (poolManager.getLiquidity(poolId) == 0) revert NothingToDistribute();
 
-        // Clear state AFTER confirming preconditions, BEFORE external call
-        // (re-entrancy safe: poolManager is trusted, but follow CEI regardless)
+        // Start a new smoothing epoch — rebate is released linearly over SMOOTHING_WINDOW.
+        // Any undistributed amount from a previous epoch rolls into the new total.
+        uint256 prev0 = _epochTotal0[poolId] - _epochDonated0[poolId];
+        uint256 prev1 = _epochTotal1[poolId] - _epochDonated1[poolId];
+
         _rebate0[poolId] = 0;
         _rebate1[poolId] = 0;
 
-        // Donate accrued rebates to in-range LPs via PoolManager.unlock → donate
-        // If this reverts the state changes above are rolled back by the EVM
-        poolManager.unlock(abi.encode(_ACT_DONATE, abi.encode(key, r0, r1)));
+        _epochStart[poolId]   = uint64(block.timestamp);
+        _epochTotal0[poolId]  = r0 + prev0;
+        _epochTotal1[poolId]  = r1 + prev1;
+        _epochDonated0[poolId] = 0;
+        _epochDonated1[poolId] = 0;
 
-        emit LPRebateDistributed(poolId, r0, r1);
+        emit LPRebateDistributed(poolId, r0 + prev0, r1 + prev1);
+        // Yield is now queued for linear release — call releaseYield() to donate vested portions.
+    }
+
+    /// @notice Release the currently vested portion of the smoothed rebate to LPs.
+    ///         Can be called by anyone — Reactive Network calls this automatically.
+    ///         Yield is released linearly: after 12h, 50% is available; after 24h, 100%.
+    function releaseYield(PoolId poolId) external {
+        _releaseVestedYield(poolId);
+    }
+
+    function _releaseVestedYield(PoolId poolId) internal {
+        uint64 start  = _epochStart[poolId];
+        if (start == 0) revert NothingToDistribute();
+
+        uint256 total0 = _epochTotal0[poolId];
+        uint256 total1 = _epochTotal1[poolId];
+        if (total0 == 0 && total1 == 0) revert NothingToDistribute();
+
+        if (poolManager.getLiquidity(poolId) == 0) revert NothingToDistribute();
+
+        // Linear vesting: vested = total * min(elapsed, window) / window
+        uint256 elapsed = block.timestamp - start;
+        if (elapsed > SMOOTHING_WINDOW) elapsed = SMOOTHING_WINDOW;
+
+        uint256 vested0 = FullMath.mulDiv(total0, elapsed, SMOOTHING_WINDOW);
+        uint256 vested1 = FullMath.mulDiv(total1, elapsed, SMOOTHING_WINDOW);
+
+        uint256 toRelease0 = vested0 - _epochDonated0[poolId];
+        uint256 toRelease1 = vested1 - _epochDonated1[poolId];
+
+        if (toRelease0 == 0 && toRelease1 == 0) revert NothingToDistribute();
+
+        _epochDonated0[poolId] += toRelease0;
+        _epochDonated1[poolId] += toRelease1;
+
+        PoolKey memory key = _poolKeys[poolId];
+        uint256 progress = FullMath.mulDiv(elapsed, 1e18, SMOOTHING_WINDOW); // 0–1e18
+
+        poolManager.unlock(abi.encode(_ACT_DONATE, abi.encode(key, toRelease0, toRelease1)));
+
+        emit YieldReleased(poolId, toRelease0, toRelease1, progress);
+    }
+
+    /// @notice Returns the currently releasable yield for a pool.
+    function vestedYield(PoolId poolId)
+        external view
+        returns (uint256 amount0, uint256 amount1)
+    {
+        uint64 start = _epochStart[poolId];
+        if (start == 0) return (0, 0);
+
+        uint256 elapsed = block.timestamp - start;
+        if (elapsed > SMOOTHING_WINDOW) elapsed = SMOOTHING_WINDOW;
+
+        uint256 vested0 = FullMath.mulDiv(_epochTotal0[poolId], elapsed, SMOOTHING_WINDOW);
+        uint256 vested1 = FullMath.mulDiv(_epochTotal1[poolId], elapsed, SMOOTHING_WINDOW);
+
+        amount0 = vested0 > _epochDonated0[poolId] ? vested0 - _epochDonated0[poolId] : 0;
+        amount1 = vested1 > _epochDonated1[poolId] ? vested1 - _epochDonated1[poolId] : 0;
     }
 
     // -----------------------------------------------------------------------
