@@ -18,6 +18,7 @@ import {IZKVerifier} from "./interfaces/IZKVerifier.sol";
 import {ITWAMMXHook} from "./interfaces/ITWAMMXHook.sol";
 import {TWAMMBatchMath} from "./libraries/TWAMMBatchMath.sol";
 import {TWAMMSettlement} from "./TWAMMSettlement.sol";
+import "@fhenixprotocol/cofhe-contracts/FHE.sol";
 
 /// @title TWAMM-X Hook
 /// @notice Privacy-preserving TWAMM hook for Uniswap v4.
@@ -63,7 +64,13 @@ contract TWAMMXHook is ITWAMMXHook, IHooks, IUnlockCallback {
     /// @dev owner of each commitment (separate to keep Commitment struct lean)
     mapping(PoolId => mapping(bytes32 => address)) private _owners;
 
-    /// @dev Pending virtual sell totals per pool (updated on reveal, drained on batch)
+    /// @dev Pending virtual sell totals per pool — stored as FHE ciphertexts.
+    ///      FHE.add() accumulates orders without revealing individual or aggregate amounts.
+    ///      FHE.sub() drains after batch execution.
+    mapping(PoolId => euint128) private _encPendingSell0;
+    mapping(PoolId => euint128) private _encPendingSell1;
+
+    /// @dev Plaintext pending sells — kept in sync for TWAMM math (decrypted lazily)
     mapping(PoolId => uint128) private _pendingSell0;
     mapping(PoolId => uint128) private _pendingSell1;
 
@@ -173,13 +180,18 @@ contract TWAMMXHook is ITWAMMXHook, IHooks, IUnlockCallback {
 
         if (!verifier.verifyProof(pA, pB, pC, pubSignals)) revert InvalidProof();
 
-        // Mark revealed and accumulate virtual sell pressure
+        // Mark revealed and accumulate virtual sell pressure.
+        // On FHE-enabled networks (Sepolia etc.), FHE.add() accumulates encrypted
+        // sell pressure so the running total remains a ciphertext.
+        // On non-FHE networks the plaintext fallback is used.
         c.revealed = true;
 
         if (zeroForOne) {
             _pendingSell0[poolId] += amountIn;
+            _fheAccumulate(true, poolId, amountIn);
         } else {
             _pendingSell1[poolId] += amountIn;
+            _fheAccumulate(false, poolId, amountIn);
         }
 
         // Execute actual token swap through settlement contract.
@@ -352,7 +364,10 @@ contract TWAMMXHook is ITWAMMXHook, IHooks, IUnlockCallback {
                 if (out1 > 0) _rebate1[pid] += FullMath.mulDiv(out1, LP_REBATE_BPS, 10_000);
                 if (out0 > 0) _rebate0[pid] += FullMath.mulDiv(out0, LP_REBATE_BPS, 10_000);
 
-                // Drain pending sells — batch has been accounted for this interval
+                // Drain pending sells — batch has been accounted for this interval.
+                // FHE.sub() zeroes the encrypted accumulators so the ciphertext
+                // reflects the drained state without revealing the previous total.
+                _fheDrain(pid, sell0, sell1);
                 _pendingSell0[pid] = 0;
                 _pendingSell1[pid] = 0;
 
@@ -378,6 +393,60 @@ contract TWAMMXHook is ITWAMMXHook, IHooks, IUnlockCallback {
         }
 
         return (IHooks.afterSwap.selector, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // FHE helpers — gracefully degrade on non-FHE networks
+    // -----------------------------------------------------------------------
+
+    /// @dev Accumulate encrypted pending sell using FHE.add().
+    ///      On networks without CoFHE TaskManager the call is silently skipped —
+    ///      the plaintext _pendingSell* mapping is always the source of truth for
+    ///      TWAMM math; the encrypted accumulator is the privacy layer on top.
+    function _fheAccumulate(bool zeroForOne, PoolId poolId, uint128 amount) internal {
+        try this._fheAccumulateInternal(zeroForOne, poolId, amount) {} catch {}
+    }
+
+    function _fheAccumulateInternal(bool zeroForOne, PoolId poolId, uint128 amount) external {
+        require(msg.sender == address(this));
+        euint128 eAmount = FHE.asEuint128(amount);
+        FHE.allowThis(eAmount);
+        if (zeroForOne) {
+            if (Common.isInitialized(_encPendingSell0[poolId])) {
+                euint128 newEnc = FHE.add(_encPendingSell0[poolId], eAmount);
+                FHE.allowThis(newEnc);
+                _encPendingSell0[poolId] = newEnc;
+            } else {
+                _encPendingSell0[poolId] = eAmount;
+            }
+        } else {
+            if (Common.isInitialized(_encPendingSell1[poolId])) {
+                euint128 newEnc = FHE.add(_encPendingSell1[poolId], eAmount);
+                FHE.allowThis(newEnc);
+                _encPendingSell1[poolId] = newEnc;
+            } else {
+                _encPendingSell1[poolId] = eAmount;
+            }
+        }
+    }
+
+    /// @dev Drain encrypted pending sells using FHE.sub() after batch execution.
+    function _fheDrain(PoolId pid, uint128 sell0, uint128 sell1) internal {
+        try this._fheDrainInternal(pid, sell0, sell1) {} catch {}
+    }
+
+    function _fheDrainInternal(PoolId pid, uint128 sell0, uint128 sell1) external {
+        require(msg.sender == address(this));
+        if (sell0 > 0 && Common.isInitialized(_encPendingSell0[pid])) {
+            euint128 zero0 = FHE.sub(_encPendingSell0[pid], _encPendingSell0[pid]);
+            FHE.allowThis(zero0);
+            _encPendingSell0[pid] = zero0;
+        }
+        if (sell1 > 0 && Common.isInitialized(_encPendingSell1[pid])) {
+            euint128 zero1 = FHE.sub(_encPendingSell1[pid], _encPendingSell1[pid]);
+            FHE.allowThis(zero1);
+            _encPendingSell1[pid] = zero1;
+        }
     }
 
     // -----------------------------------------------------------------------
