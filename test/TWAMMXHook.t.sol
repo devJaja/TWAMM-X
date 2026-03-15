@@ -21,6 +21,7 @@ import {TWAMMXHook} from "../src/TWAMMXHook.sol";
 import {TWAMMSettlement} from "../src/TWAMMSettlement.sol";
 import {ITWAMMXHook} from "../src/interfaces/ITWAMMXHook.sol";
 import {Groth16Verifier} from "../src/libraries/Groth16Verifier.sol";
+import {MockGroth16Verifier} from "../src/libraries/MockGroth16Verifier.sol";
 import {TWAMMBatchMath} from "../src/libraries/TWAMMBatchMath.sol";
 
 // ---------------------------------------------------------------------------
@@ -108,11 +109,11 @@ contract TWAMMXHookTest is Test {
     uint160 constant HOOK_FLAGS    = uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG);
     uint160 constant SQRT_PRICE_1_1 = 79228162514264337593543950336;
 
-    PoolManager     poolManager;
-    TWAMMXHook      hook;
-    TWAMMSettlement settlement;
-    Groth16Verifier zkVerifier;
-    UnlockRouter    router;
+    PoolManager         poolManager;
+    TWAMMXHook          hook;
+    TWAMMSettlement     settlement;
+    MockGroth16Verifier zkVerifier; // mock for tests; use Groth16Verifier in production
+    UnlockRouter        router;
     MockERC20       token0;
     MockERC20       token1;
     PoolKey         key;
@@ -127,7 +128,7 @@ contract TWAMMXHookTest is Test {
 
     function setUp() public {
         poolManager = new PoolManager(address(this));
-        zkVerifier  = new Groth16Verifier();
+        zkVerifier  = new MockGroth16Verifier();
         router      = new UnlockRouter(IPoolManager(address(poolManager)));
 
         // Predict hook deploy address so settlement can reference it

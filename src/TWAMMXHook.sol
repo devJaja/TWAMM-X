@@ -219,6 +219,17 @@ contract TWAMMXHook is ITWAMMXHook, IHooks, IUnlockCallback {
 
     /// @inheritdoc ITWAMMXHook
     function distributeLPRebate(PoolId poolId) external override {
+        _distributeLPRebate(poolId);
+    }
+
+    /// @notice Reactive Network callback entry point.
+    ///         Called automatically by TWAMMXReactive after each BatchExecuted event.
+    ///         Uses a distinct name since PoolId is bytes32 at the ABI level.
+    function reactiveDistributeRebate(bytes32 poolId) external {
+        _distributeLPRebate(PoolId.wrap(poolId));
+    }
+
+    function _distributeLPRebate(PoolId poolId) internal {
         uint256 r0 = _rebate0[poolId];
         uint256 r1 = _rebate1[poolId];
         if (r0 == 0 && r1 == 0) revert NothingToDistribute();
