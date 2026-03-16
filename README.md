@@ -1,7 +1,8 @@
 # TWAMM-X
 
 > Next-generation privacy-preserving TWAMM hook for Uniswap v4.  
-> Executes large orders invisibly, eliminates MEV leakage, and protects LPs through zero-knowledge batch execution with smoothed yield distribution.
+> Executes large orders invisibly, eliminates MEV leakage, and protects LPs through zero-knowledge batch execution with smoothed yield distribution.  
+> Implements a **24-hour linear yield smoothing system** — instead of distributing fees as unpredictable lump sums, every rebate epoch releases yield continuously so LPs receive predictable, sustainable income from TWAMM order flow.
 
 ---
 
