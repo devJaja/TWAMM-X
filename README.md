@@ -1,7 +1,31 @@
 # TWAMM-X
 
 > Next-generation privacy-preserving TWAMM hook for Uniswap v4.  
-> Executes large orders invisibly, eliminates MEV leakage, and protects LPs through zero-knowledge batch execution.
+> Executes large orders invisibly, eliminates MEV leakage, and protects LPs through zero-knowledge batch execution with smoothed yield distribution.
+
+---
+
+## Prize Tracks
+
+### 🏆 UHI9 Hookathon — Impermanent Loss & Yield Systems
+
+**Track: Fee-Smoothing Hooks**
+> *Hooks that automatically reinvest or distribute yield over time, smoothing fee flow for LPs.*
+
+TWAMM-X implements a **24-hour linear yield smoothing system** for LP rebates. Instead of distributing fees as unpredictable lump sums, every rebate epoch releases yield continuously — LPs receive predictable, sustainable income from TWAMM order flow.
+
+- `distributeLPRebate()` — commits accrued rebate into a 24h smoothing epoch
+- `releaseYield()` — donates the currently vested portion to in-range LPs (auto-triggered by Reactive Network)
+- `vestedYield()` — view function returning releasable amount at any point in time
+- Undistributed balance rolls forward into the next epoch — no yield is ever lost
+
+### 🏆 Sponsor Tracks
+
+| Sponsor | Integration |
+|---|---|
+| **Fhenix CoFHE** | `FHE.add()`, `FHE.sub()`, `FHE.decrypt()`, `euint128`, `ebool` — encrypted order amounts and directions stored on-chain |
+| **Reactive Network** | `TWAMMXReactive` auto-triggers LP rebate distribution on every `BatchExecuted` event — no keeper required |
+| **Uniswap v4** | Full `beforeSwap` / `afterSwap` hook with ZK commit-reveal, TWAMM batch math, and settlement |
 
 ---
 
@@ -20,7 +44,7 @@ TWAMM-X combines four technologies into a single Uniswap v4 hook:
 
 ```
 src/
-├── TWAMMXHook.sol              # Core hook — beforeSwap / afterSwap
+├── TWAMMXHook.sol              # Core hook — beforeSwap / afterSwap / fee-smoothing
 ├── TWAMMSettlement.sol         # Plaintext token custodian and swap executor
 ├── TWAMMXSettlementFHE.sol     # FHE-enhanced settlement — encrypted amounts/directions
 ├── TWAMMXReactive.sol          # Reactive Network contract — auto LP rebate distribution
@@ -39,7 +63,7 @@ circuits/
 └── gen_proof.js                # Proof generation script
 
 test/
-└── TWAMMXHook.t.sol            # 25 Foundry tests — all passing
+└── TWAMMXHook.t.sol            # 27 Foundry tests — all passing
 
 script/
 └── Deploy.s.sol                # Deployment script
@@ -65,11 +89,39 @@ script/
 
 4. Auto-distribution TWAMMXReactive (on Reactive Network) watches BatchExecuted events
                      Automatically calls hook.reactiveDistributeRebate()
-                     LP rebates donated to in-range LPs — no manual trigger needed
+                     Starts a 24h smoothing epoch — yield released linearly to in-range LPs
 
-5. claim()           Trader calls requestClaimDecryption(), waits for CoFHE,
+5. releaseYield()    Anyone (or Reactive Network) calls releaseYield() to donate
+                     the currently vested portion — predictable, continuous LP income
+
+6. claim()           Trader calls requestClaimDecryption(), waits for CoFHE,
                      then calls claim() to withdraw output tokens
 ```
+
+---
+
+## Fee-Smoothing Yield System
+
+The LP rebate system implements **YieldBasis-style predictable returns** for liquidity providers:
+
+```
+Rebate accrues from TWAMM virtual order flow (5 bps per batch)
+         ↓
+distributeLPRebate() → commits total to a 24h linear vesting epoch
+         ↓
+releaseYield() → donates: total × elapsed / 24h  (minus already donated)
+         ↓
+LPs receive continuous yield — not unpredictable lump sums
+```
+
+| Time elapsed | % of epoch yield released |
+|---|---|
+| 6 hours | 25% |
+| 12 hours | 50% |
+| 18 hours | 75% |
+| 24 hours | 100% |
+
+Undistributed balance from a previous epoch rolls into the next — no yield is ever lost.
 
 ---
 
@@ -137,7 +189,7 @@ At execution time, `FHE.decrypt()` requests async decryption from the CoFHE thre
 | Order amount visible in contract storage | Amount stored as `euint128` ciphertext — unreadable on-chain |
 | Swap direction visible after reveal | Direction stored as `ebool` — never exposed |
 | Output balance readable by anyone | Claimable balance encrypted — only owner can decrypt |
-| Aggregate virtual sell pressure visible | Can be accumulated via `FHE.add()` without revealing individual orders |
+| Aggregate virtual sell pressure visible | Accumulated via `FHE.add()` without revealing individual orders |
 
 ### Access control
 
@@ -163,7 +215,8 @@ The plaintext `TWAMMSettlement` remains available for networks without CoFHE sup
 ```
 BatchExecuted (Ethereum) → TWAMMXReactive.react() (Reactive Network)
                          → Callback → hook.reactiveDistributeRebate() (Ethereum)
-                         → LP rebates donated automatically
+                         → 24h smoothing epoch starts
+                         → releaseYield() called periodically → LP yield distributed
 ```
 
 ---
@@ -216,33 +269,35 @@ node gen_proof.js   # outputs proof.json, public.json, test_proof.json
 ## Test Results
 
 ```
-Ran 25 tests — 25 passed, 0 failed
+Ran 27 tests — 27 passed, 0 failed
 
-test_cancelOrder                       ✓
-test_cancelOrder_nonOwner              ✓
-test_commitOrder                       ✓
-test_commitOrder_invalidDelay          ✓
-test_commitOrder_zeroHash              ✓
-test_distributeLPRebate                ✓
+test_cancelOrder                            ✓
+test_cancelOrder_nonOwner                   ✓
+test_commitOrder                            ✓
+test_commitOrder_invalidDelay               ✓
+test_commitOrder_zeroHash                   ✓
+test_distributeLPRebate                     ✓
 test_distributeLPRebate_nothingToDistribute ✓
-test_hookAddressFlags                  ✓
-test_immutables                        ✓
-test_lpRebateAccruesFromSwap           ✓
-test_multipleReveals_accumulatePending ✓
-test_onlyPoolManager_afterSwap         ✓
-test_onlyPoolManager_beforeSwap        ✓
-test_plainSwap                         ✓
-test_revealOrder                       ✓
-test_revealOrder_beforeExpiry          ✓
-test_revealOrder_doubleReveal          ✓
-test_revealOrder_hashMismatch          ✓
-test_settlement_fullFlow               ✓
-test_settlement_onlyHook               ✓
-test_settlement_refund                 ✓
-test_twammBatchExecutes                ✓
-test_twammBatchMath_noOrders           ✓
-test_twammBatchMath_sell0MovesPrice    ✓
-test_twammBatchMath_sell1MovesPrice    ✓
+test_hookAddressFlags                       ✓
+test_immutables                             ✓
+test_lpRebateAccruesFromSwap                ✓
+test_multipleReveals_accumulatePending      ✓
+test_onlyPoolManager_afterSwap              ✓
+test_onlyPoolManager_beforeSwap             ✓
+test_plainSwap                              ✓
+test_releaseYield_partialRelease            ✓
+test_revealOrder                            ✓
+test_revealOrder_beforeExpiry               ✓
+test_revealOrder_doubleReveal               ✓
+test_revealOrder_hashMismatch               ✓
+test_settlement_fullFlow                    ✓
+test_settlement_onlyHook                    ✓
+test_settlement_refund                      ✓
+test_twammBatchExecutes                     ✓
+test_twammBatchMath_noOrders                ✓
+test_twammBatchMath_sell0MovesPrice         ✓
+test_twammBatchMath_sell1MovesPrice         ✓
+test_yieldSmoothing_linearRelease           ✓
 ```
 
 ---
