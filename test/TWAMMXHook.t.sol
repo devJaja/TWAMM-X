@@ -20,6 +20,8 @@ import {IERC20Minimal} from "@uniswap/v4-core/interfaces/external/IERC20Minimal.
 import {TWAMMXHook} from "../src/TWAMMXHook.sol";
 import {TWAMMSettlement} from "../src/TWAMMSettlement.sol";
 import {ITWAMMXHook} from "../src/interfaces/ITWAMMXHook.sol";
+import "../src/interfaces/Errors.sol";
+import "../src/interfaces/Events.sol";
 import {Groth16Verifier} from "../src/libraries/Groth16Verifier.sol";
 import {MockGroth16Verifier} from "../src/libraries/MockGroth16Verifier.sol";
 import {TWAMMBatchMath} from "../src/libraries/TWAMMBatchMath.sol";
@@ -209,7 +211,7 @@ contract TWAMMXHookTest is Test {
         uint64  delay = hook.MIN_ORDER_DELAY();
 
         vm.expectEmit(true, false, true, false);
-        emit ITWAMMXHook.OrderCommitted(poolId, bytes32(0), address(this), 0);
+        emit OrderCommitted(poolId, bytes32(0), address(this), 0);
 
         bytes32 cid = hook.commitOrder(poolId, hash, delay);
         assertTrue(cid != bytes32(0));
@@ -225,7 +227,7 @@ contract TWAMMXHookTest is Test {
     // -----------------------------------------------------------------------
     function test_commitOrder_invalidDelay() public {
         bytes32 hash = _makeHash(address(this), 100e18, true, bytes32("s"));
-        vm.expectRevert(ITWAMMXHook.InvalidDelay.selector);
+        vm.expectRevert(InvalidDelay.selector);
         hook.commitOrder(poolId, hash, 10); // < MIN_ORDER_DELAY
     }
 
@@ -233,7 +235,7 @@ contract TWAMMXHookTest is Test {
     // 5. commitOrder with zero hash reverts
     // -----------------------------------------------------------------------
     function test_commitOrder_zeroHash() public {
-        vm.expectRevert(ITWAMMXHook.ZeroAmount.selector);
+        vm.expectRevert(ZeroAmount.selector);
         hook.commitOrder(poolId, bytes32(0), 2 minutes); // use literal delay, not hook constant
     }
 
@@ -252,7 +254,7 @@ contract TWAMMXHookTest is Test {
         vm.warp(block.timestamp + delay + 1);
 
         vm.expectEmit(true, true, false, true);
-        emit ITWAMMXHook.OrderRevealed(poolId, cid, amountIn, true);
+        emit OrderRevealed(poolId, cid, amountIn, true);
 
         hook.revealOrder(poolId, cid, amountIn, true, salt, pA, pB, pC);
 
@@ -273,7 +275,7 @@ contract TWAMMXHookTest is Test {
         bytes32 hash = _makeHash(address(this), 100e18, true, salt);
         bytes32 cid  = hook.commitOrder(poolId, hash, hook.MIN_ORDER_DELAY());
 
-        vm.expectRevert(ITWAMMXHook.CommitmentNotExpired.selector);
+        vm.expectRevert(CommitmentNotExpired.selector);
         hook.revealOrder(poolId, cid, 100e18, true, salt, pA, pB, pC);
     }
 
@@ -286,7 +288,7 @@ contract TWAMMXHookTest is Test {
         bytes32 cid  = hook.commitOrder(poolId, hash, hook.MIN_ORDER_DELAY());
         vm.warp(block.timestamp + hook.MIN_ORDER_DELAY() + 1);
 
-        vm.expectRevert(ITWAMMXHook.HashMismatch.selector);
+        vm.expectRevert(HashMismatch.selector);
         // wrong amountIn
         hook.revealOrder(poolId, cid, 999e18, true, salt, pA, pB, pC);
     }
@@ -302,7 +304,7 @@ contract TWAMMXHookTest is Test {
 
         hook.revealOrder(poolId, cid, 100e18, true, salt, pA, pB, pC);
 
-        vm.expectRevert(ITWAMMXHook.CommitmentAlreadyRevealed.selector);
+        vm.expectRevert(CommitmentAlreadyRevealed.selector);
         hook.revealOrder(poolId, cid, 100e18, true, salt, pA, pB, pC);
     }
 
@@ -314,7 +316,7 @@ contract TWAMMXHookTest is Test {
         bytes32 cid  = hook.commitOrder(poolId, hash, hook.MIN_ORDER_DELAY());
 
         vm.expectEmit(true, true, true, false);
-        emit ITWAMMXHook.OrderCancelled(poolId, cid, address(this));
+        emit OrderCancelled(poolId, cid, address(this));
 
         hook.cancelOrder(poolId, cid);
 
@@ -330,7 +332,7 @@ contract TWAMMXHookTest is Test {
         bytes32 cid  = hook.commitOrder(poolId, hash, hook.MIN_ORDER_DELAY());
 
         vm.prank(alice);
-        vm.expectRevert(ITWAMMXHook.CommitmentNotFound.selector);
+        vm.expectRevert(CommitmentNotFound.selector);
         hook.cancelOrder(poolId, cid);
     }
 
@@ -390,7 +392,7 @@ contract TWAMMXHookTest is Test {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         bool found;
         for (uint256 i; i < logs.length; i++) {
-            if (logs[i].topics[0] == ITWAMMXHook.BatchExecuted.selector) {
+            if (logs[i].topics[0] == BatchExecuted.selector) {
                 found = true;
                 break;
             }
@@ -515,7 +517,7 @@ contract TWAMMXHookTest is Test {
     // 18. distributeLPRebate with nothing accrued reverts
     // -----------------------------------------------------------------------
     function test_distributeLPRebate_nothingToDistribute() public {
-        vm.expectRevert(ITWAMMXHook.NothingToDistribute.selector);
+        vm.expectRevert(NothingToDistribute.selector);
         hook.distributeLPRebate(poolId);
     }
 
@@ -523,14 +525,14 @@ contract TWAMMXHookTest is Test {
     // 17. onlyPoolManager guard
     // -----------------------------------------------------------------------
     function test_onlyPoolManager_beforeSwap() public {
-        vm.expectRevert(ITWAMMXHook.OnlyPoolManager.selector);
+        vm.expectRevert(OnlyPoolManager.selector);
         hook.beforeSwap(address(this), key,
             SwapParams({zeroForOne: true, amountSpecified: -1e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
             "");
     }
 
     function test_onlyPoolManager_afterSwap() public {
-        vm.expectRevert(ITWAMMXHook.OnlyPoolManager.selector);
+        vm.expectRevert(OnlyPoolManager.selector);
         hook.afterSwap(address(this), key,
             SwapParams({zeroForOne: true, amountSpecified: -1e18, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
             BalanceDelta.wrap(0), "");
@@ -653,7 +655,7 @@ contract TWAMMXHookTest is Test {
     // 22. Settlement: non-hook cannot call executeSwap
     // -----------------------------------------------------------------------
     function test_settlement_onlyHook() public {
-        vm.expectRevert(TWAMMSettlement.OnlyHook.selector);
+        vm.expectRevert(OnlyHook.selector);
         settlement.executeSwap(bytes32("x"), key, true);
     }
 

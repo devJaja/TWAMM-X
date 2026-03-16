@@ -12,6 +12,8 @@ import {TickMath} from "@uniswap/v4-core/libraries/TickMath.sol";
 import {IERC20Minimal} from "@uniswap/v4-core/interfaces/external/IERC20Minimal.sol";
 
 import "@fhenixprotocol/cofhe-contracts/FHE.sol";
+import "./interfaces/Errors.sol";
+import "./interfaces/Events.sol";
 
 /// @title TWAMMXSettlementFHE
 /// @notice FHE-enhanced settlement contract for TWAMM-X.
@@ -35,28 +37,6 @@ import "@fhenixprotocol/cofhe-contracts/FHE.sol";
 ///   - claimable[owner]   : uint256  → euint128  (encrypted, owner-only readable)
 contract TWAMMXSettlementFHE is IUnlockCallback {
     using PoolIdLibrary for PoolKey;
-
-    // -----------------------------------------------------------------------
-    // Errors
-    // -----------------------------------------------------------------------
-
-    error OnlyHook();
-    error NothingToClaim();
-    error TransferFailed();
-    error DecryptionNotReady();
-
-    // -----------------------------------------------------------------------
-    // Events
-    // -----------------------------------------------------------------------
-
-    event EncryptedDeposit(bytes32 indexed commitmentId, address indexed owner);
-    event SwapExecuted(bytes32 indexed commitmentId, address indexed owner);
-    event Claimed(address indexed owner, address token);
-    event Refunded(bytes32 indexed commitmentId, address indexed owner);
-
-    // -----------------------------------------------------------------------
-    // Storage
-    // -----------------------------------------------------------------------
 
     IPoolManager public immutable poolManager;
     address       public immutable hook;
@@ -209,7 +189,7 @@ contract TWAMMXSettlementFHE is IUnlockCallback {
             encryptedClaimable[owner][tokenOut] = eOut;
         }
 
-        emit SwapExecuted(commitmentId, owner);
+        emit SwapExecuted(commitmentId, owner, amountOut);
     }
 
     // -----------------------------------------------------------------------
@@ -282,7 +262,7 @@ contract TWAMMXSettlementFHE is IUnlockCallback {
         bool ok = IERC20Minimal(token).transfer(msg.sender, amount);
         if (!ok) revert TransferFailed();
 
-        emit Claimed(msg.sender, token);
+        emit Claimed(msg.sender, token, amount);
     }
 
     // -----------------------------------------------------------------------
@@ -304,6 +284,6 @@ contract TWAMMXSettlementFHE is IUnlockCallback {
         bool ok = IERC20Minimal(token).transfer(msg.sender, plainAmount);
         if (!ok) revert TransferFailed();
 
-        emit Refunded(commitmentId, msg.sender);
+        emit Refunded(commitmentId, msg.sender, plainAmount);
     }
 }

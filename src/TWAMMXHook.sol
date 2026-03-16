@@ -18,6 +18,8 @@ import {IZKVerifier} from "./interfaces/IZKVerifier.sol";
 import {ITWAMMXHook} from "./interfaces/ITWAMMXHook.sol";
 import {TWAMMBatchMath} from "./libraries/TWAMMBatchMath.sol";
 import {TWAMMSettlement} from "./TWAMMSettlement.sol";
+import "./interfaces/Errors.sol";
+import "./interfaces/Events.sol";
 import "@fhenixprotocol/cofhe-contracts/FHE.sol";
 
 /// @title TWAMM-X Hook

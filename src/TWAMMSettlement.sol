@@ -10,6 +10,8 @@ import {BalanceDelta} from "@uniswap/v4-core/types/BalanceDelta.sol";
 import {SwapParams} from "@uniswap/v4-core/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/libraries/TickMath.sol";
 import {IERC20Minimal} from "@uniswap/v4-core/interfaces/external/IERC20Minimal.sol";
+import "./interfaces/Errors.sol";
+import "./interfaces/Events.sol";
 
 /// @title TWAMMSettlement
 /// @notice Custodian and swap executor for TWAMM-X orders.
@@ -22,28 +24,6 @@ import {IERC20Minimal} from "@uniswap/v4-core/interfaces/external/IERC20Minimal.
 ///   4. Trader calls refund() to recover funds if they cancel before reveal.
 contract TWAMMSettlement is IUnlockCallback {
     using PoolIdLibrary for PoolKey;
-
-    // -----------------------------------------------------------------------
-    // Errors
-    // -----------------------------------------------------------------------
-
-    error OnlyHook();
-    error InsufficientDeposit();
-    error NothingToClaim();
-    error TransferFailed();
-
-    // -----------------------------------------------------------------------
-    // Events
-    // -----------------------------------------------------------------------
-
-    event Deposited(bytes32 indexed commitmentId, address indexed owner, address token, uint128 amount);
-    event SwapExecuted(bytes32 indexed commitmentId, address indexed owner, uint256 amountOut);
-    event Claimed(address indexed owner, address token, uint256 amount);
-    event Refunded(bytes32 indexed commitmentId, address indexed owner, uint256 amount);
-
-    // -----------------------------------------------------------------------
-    // Storage
-    // -----------------------------------------------------------------------
 
     IPoolManager public immutable poolManager;
     address       public immutable hook;
