@@ -5,7 +5,6 @@
 
 ---
 
-## Prize Tracks
 
 ### 🏆 UHI9 Hookathon — Impermanent Loss & Yield Systems
 
