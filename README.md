@@ -6,7 +6,6 @@
 
 ---
 
-
 ### 🏆 UHI9 Hookathon — Impermanent Loss & Yield Systems
 
 **Track: Fee-Smoothing Hooks**
@@ -23,7 +22,7 @@ TWAMM-X implements a **24-hour linear yield smoothing system** for LP rebates. I
 
 | Sponsor | Integration |
 |---|---|
-| **Fhenix CoFHE** | `FHE.add()`, `FHE.sub()`, `FHE.decrypt()`, `euint128`, `ebool` — encrypted order amounts and directions stored on-chain |
+| **Fhenix CoFHE** | `FHE.add()`, `FHE.sub()`, `FHE.decrypt()`, `euint128`, `ebool` — encrypted order amounts and directions stored on-chain; gracefully degrades on non-FHE networks via try/catch |
 | **Reactive Network** | `TWAMMXReactive` auto-triggers LP rebate distribution on every `BatchExecuted` event — no keeper required |
 | **Uniswap v4** | Full `beforeSwap` / `afterSwap` hook with ZK commit-reveal, TWAMM batch math, and settlement |
 
@@ -38,6 +37,14 @@ TWAMM-X combines four technologies into a single Uniswap v4 hook:
 - **Continuous TWAMM math** — closed-form batch execution based on the Paradigm TWAMM paper
 - **Reactive automation** — LP rebates are distributed automatically via Reactive Network, no keeper required
 
+### The Core Problem
+
+Large on-chain orders are visible to everyone. MEV bots see them, front-run them, and extract value from both the trader and LPs. TWAMM-X hides the order entirely until after it executes.
+
+But hiding orders alone isn't enough. Even when fees do reach LPs, they arrive as unpredictable lump sums — a spike when a big batch executes, then silence. This makes LP returns volatile and hard to reason about, discouraging liquidity provision and causing LPs to misprice their risk.
+
+TWAMM-X solves both problems: orders are invisible until executed, and the resulting fees are distributed to LPs as a continuous, predictable stream over 24 hours — not random windfalls.
+
 ---
 
 ## Architecture
@@ -50,7 +57,9 @@ src/
 ├── TWAMMXReactive.sol          # Reactive Network contract — auto LP rebate distribution
 ├── interfaces/
 │   ├── ITWAMMXHook.sol         # Full public interface
-│   └── IZKVerifier.sol         # Groth16 verifier interface (snarkjs-compatible)
+│   ├── IZKVerifier.sol         # Groth16 verifier interface (snarkjs-compatible)
+│   ├── Errors.sol              # Custom error definitions
+│   └── Events.sol              # Event definitions
 └── libraries/
     ├── TWAMMBatchMath.sol       # Closed-form TWAMM price formula with exp() Taylor series
     ├── Groth16Verifier.sol      # Real snarkjs-generated Groth16 verifier
@@ -75,16 +84,18 @@ script/
 
 ```
 1. commitOrder()     Trader submits hash(owner, amount, direction, salt) — no order details on-chain
+                     commitmentId = keccak256(owner, hash, expiry, chainId) — unique per submission
                      + depositFHE() encrypts amount + direction via Fhenix CoFHE before storing
 
 2. revealOrder()     After expiry, trader submits ZK proof + plaintext order
                      Hook verifies: Groth16 proof + hash match
+                     poolIdHash public signal binds proof to this pool — prevents cross-pool replay
                      TWAMMXSettlementFHE requests async FHE decryption of encrypted amount
                      Swap executes once CoFHE threshold network delivers plaintext
                      Output credited as encrypted euint128 — only trader can decrypt
 
 3. afterSwap         On every swap, accumulated virtual orders run through
-                     closed-form TWAMM batch math
+                     closed-form TWAMM batch math (one-sided or two-sided depending on order mix)
                      LP shield rebate accrues (5 bps of virtual volume)
 
 4. Auto-distribution TWAMMXReactive (on Reactive Network) watches BatchExecuted events
@@ -96,6 +107,9 @@ script/
 
 6. claim()           Trader calls requestClaimDecryption(), waits for CoFHE,
                      then calls claim() to withdraw output tokens
+
+[cancel path]        Trader calls cancelOrder() before reveal to delete the commitment
+                     Then calls refund() on the settlement contract to recover deposited funds
 ```
 
 ---
@@ -137,7 +151,7 @@ The `order_commit.circom` circuit proves:
 Private inputs (never on-chain): `owner`, `amountIn`, `zeroForOne`, `salt`  
 Public inputs (on-chain): `commitmentHash`, `poolIdHash`, `expiry`
 
-The `poolIdHash` binds the proof to a specific pool, preventing cross-pool replay attacks.
+The `poolIdHash` binds the proof to a specific pool, preventing cross-pool replay attacks. It is verified by the Solidity hook (`pubSignals[1] == uint256(poolId)`) rather than constrained inside the circuit.
 
 ---
 
@@ -145,15 +159,19 @@ The `poolIdHash` binds the proof to a specific pool, preventing cross-pool repla
 
 Implements the exact closed-form solution from the [Paradigm TWAMM paper](https://www.paradigm.xyz/2021/07/twamm):
 
+**Two-sided (both token0 and token1 orders present):**
 ```
 sqrtP_end = (a·sqrtP_0 + b·c·e) / (a + b·e)
 
 where:
   a = sqrtP_0 + c
   b = sqrtP_0 - c
-  c = sqrt(k0 / k1)          equilibrium price ratio
-  e = exp(2·sqrt(k0·k1)·Δt / L)   exponential decay factor
+  c = sqrt(k0 / k1)                      equilibrium price ratio
+  e = exp(2·sqrt(k0·k1)·Δt / L)          exponential decay factor
 ```
+
+**One-sided (only token0 or only token1 orders):**  
+Price moves monotonically along the AMM curve using the constant-product formula directly — no exponential needed.
 
 `exp()` is computed via a 6-term Taylor series with range reduction, accurate to <0.01% for all practical TWAMM intervals.
 
@@ -169,7 +187,7 @@ TWAMM-X uses [Fhenix CoFHE](https://cofhe-docs.fhenix.zone) to encrypt order sta
 
 `TWAMMXSettlementFHE` replaces plaintext deposit storage with FHE ciphertext handles:
 
-```
+```solidity
 // Plaintext (TWAMMSettlement)
 mapping(bytes32 => uint128) depositAmount;
 
@@ -181,6 +199,8 @@ mapping(bytes32 => ebool)    encryptedDirection;
 The trader encrypts their order client-side using [cofhejs](https://cofhe-docs.fhenix.zone/cofhejs/introduction/overview) before sending to the contract. The contract stores only the ciphertext handle — the plaintext never appears on-chain.
 
 At execution time, `FHE.decrypt()` requests async decryption from the CoFHE threshold network. Once ready, `FHE.getDecryptResultSafe()` retrieves the plaintext amount for the actual PoolManager swap. Output is re-encrypted as `euint128` and stored — only the trader can decrypt their own balance using their wallet key via cofhejs.
+
+The FHE accumulation in `TWAMMXHook` uses a try/catch pattern — on networks without a CoFHE TaskManager the encrypted accumulator calls are silently skipped, and the plaintext `_pendingSell*` mappings remain the source of truth for TWAMM math. FHE is a privacy layer on top, not a dependency for correctness.
 
 ### Privacy benefits
 
@@ -218,6 +238,8 @@ BatchExecuted (Ethereum) → TWAMMXReactive.react() (Reactive Network)
                          → 24h smoothing epoch starts
                          → releaseYield() called periodically → LP yield distributed
 ```
+
+The `react()` function is guarded by `vmOnly` — it only runs on ReactVM. The constructor uses `!vm` to skip the `service.subscribe()` call on non-Reactive networks, making the contract safe to compile and test anywhere.
 
 ---
 

@@ -45,20 +45,23 @@ library TWAMMBatchMath {
     // -----------------------------------------------------------------------
 
     /// @notice Compute the TWAMM batch execution result.
-    /// @param sqrtPriceX96  Current pool sqrt price (Q64.96).
-    /// @param liquidity     Active pool liquidity.
-    /// @param sell0         Total token0 to sell over the interval.
-    /// @param sell1         Total token1 to sell over the interval.
-    /// @param elapsed       Seconds elapsed since last execution.
-    /// @return amountOut0   Token0 output for sell1 orders.
-    /// @return amountOut1   Token1 output for sell0 orders.
-    /// @return newSqrtPriceX96  Ending sqrt price (Q64.96).
+    /// @param sqrtPriceX96      Current pool sqrt price (Q64.96).
+    /// @param liquidity         Active pool liquidity.
+    /// @param sell0             Total token0 to sell over the interval.
+    /// @param sell1             Total token1 to sell over the interval.
+    /// @param elapsed           Seconds elapsed since last execution.
+    /// @param sqrtPriceLimitX96 Tick boundary cap — price will not move past this value.
+    ///                          Pass TickMath.MIN_SQRT_PRICE / MAX_SQRT_PRICE for no cap.
+    /// @return amountOut0       Token0 output for sell1 orders.
+    /// @return amountOut1       Token1 output for sell0 orders.
+    /// @return newSqrtPriceX96  Ending sqrt price (Q64.96), capped at sqrtPriceLimitX96.
     function computeBatch(
         uint160 sqrtPriceX96,
         uint128 liquidity,
         uint128 sell0,
         uint128 sell1,
-        uint256 elapsed
+        uint256 elapsed,
+        uint160 sqrtPriceLimitX96
     )
         internal
         pure
@@ -194,6 +197,16 @@ library TWAMMBatchMath {
 
         // Convert back to Q96
         newSqrtPriceX96 = uint160(FullMath.mulDiv(newSqrtP_wad, Q96, WAD));
+
+        // Tick boundary cap: clamp price to sqrtPriceLimitX96 so the batch
+        // never crosses a tick boundary in a single execution. The caller
+        // (afterSwap) should re-run with the remaining sell volume in the
+        // next interval once liquidity at the new tick is known.
+        if (sell0 > 0 && newSqrtPriceX96 < sqrtPriceLimitX96) {
+            newSqrtPriceX96 = sqrtPriceLimitX96;
+        } else if (sell1 > 0 && newSqrtPriceX96 > sqrtPriceLimitX96) {
+            newSqrtPriceX96 = sqrtPriceLimitX96;
+        }
 
         // Amount outputs using virtual AMM accounting:
         //   amountOut1 = L * (sqrtP_end - sqrtP_0)   if price rose  (sell1 > sell0)

@@ -26,7 +26,8 @@ contract TWAMMSettlement is IUnlockCallback {
     using PoolIdLibrary for PoolKey;
 
     IPoolManager public immutable poolManager;
-    address       public immutable hook;
+    address       public hook;
+    address       public immutable deployer;
 
     /// @dev Deposited input token per commitment
     mapping(bytes32 => address)  public depositToken;
@@ -43,6 +44,15 @@ contract TWAMMSettlement is IUnlockCallback {
     constructor(IPoolManager _poolManager, address _hook) {
         poolManager = _poolManager;
         hook        = _hook;
+        deployer    = msg.sender;
+    }
+
+    /// @notice Set the hook address after deployment (deployer only, one-time).
+    ///         Required when hook and settlement have a circular address dependency.
+    function setHook(address _hook) external {
+        require(msg.sender == deployer, "only deployer");
+        require(hook == address(0),     "hook already set");
+        hook = _hook;
     }
 
     // -----------------------------------------------------------------------

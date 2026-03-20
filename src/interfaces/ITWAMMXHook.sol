@@ -16,7 +16,7 @@ interface ITWAMMXHook {
 
     /// @notice A ZK-hidden order commitment stored on-chain.
     struct Commitment {
-        bytes32 hash;     // keccak256(owner, amountIn, zeroForOne, salt)
+        bytes32 hash;     // Poseidon(owner, amountIn, zeroForOne, salt) — computed off-chain via circomlib
         uint64  expiry;   // earliest block.timestamp at which the order may execute
         bool    revealed; // true once the ZK proof has been verified and order executed
     }
@@ -27,7 +27,7 @@ interface ITWAMMXHook {
 
     /// @notice Commit a hidden order. Only the hash of the order is stored.
     /// @param poolId  Target pool.
-    /// @param hash    keccak256(owner, amountIn, zeroForOne, salt) — computed off-chain.
+    /// @param hash    Poseidon(owner, amountIn, zeroForOne, salt) — computed off-chain via circomlib/gen_proof.js.
     /// @param delay   Seconds until the order becomes executable.
     /// @return commitmentId Unique ID for this commitment.
     function commitOrder(PoolId poolId, bytes32 hash, uint64 delay)

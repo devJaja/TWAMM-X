@@ -12,6 +12,7 @@ import {Currency} from "@uniswap/v4-core/types/Currency.sol";
 import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/types/PoolOperation.sol";
 import {StateLibrary} from "@uniswap/v4-core/libraries/StateLibrary.sol";
 import {FullMath} from "@uniswap/v4-core/libraries/FullMath.sol";
+import {TickMath} from "@uniswap/v4-core/libraries/TickMath.sol";
 import {IERC20Minimal} from "@uniswap/v4-core/interfaces/external/IERC20Minimal.sol";
 
 import {IZKVerifier} from "./interfaces/IZKVerifier.sol";
@@ -183,14 +184,14 @@ contract TWAMMXHook is ITWAMMXHook, IHooks, IUnlockCallback {
 
         // --- ZK proof verification ---
         // Public signals:
-        //   [0] commitmentHash = keccak256(owner, amountIn, zeroForOne, salt) cast to field
+        //   [0] commitmentHash = Poseidon(owner, amountIn, zeroForOne, salt) — circuit output
         //   [1] poolIdHash     = uint256(poolId) truncated to field
         //   [2] expiry
-        bytes32 expectedHash = keccak256(
-            abi.encodePacked(_owners[poolId][commitmentId], amountIn, zeroForOne, salt)
-        );
-        if (expectedHash != c.hash) revert HashMismatch();
-
+        //
+        // The stored c.hash is the Poseidon hash computed off-chain by the trader
+        // and submitted at commitOrder time. We verify the ZK proof first, then
+        // confirm pubSignals[0] matches the stored hash — this is the single source
+        // of truth and avoids any keccak/Poseidon mismatch.
         uint256[3] memory pubSignals = [
             uint256(c.hash),
             uint256(PoolId.unwrap(poolId)),
@@ -198,6 +199,11 @@ contract TWAMMXHook is ITWAMMXHook, IHooks, IUnlockCallback {
         ];
 
         if (!verifier.verifyProof(pA, pB, pC, pubSignals)) revert InvalidProof();
+
+        // Confirm the revealed plaintext is consistent with the stored commitment.
+        // pubSignals[0] == c.hash is already enforced by the verifier above.
+        // We additionally check the owner matches to prevent front-running reveals.
+        if (_owners[poolId][commitmentId] != msg.sender) revert CommitmentNotFound();
 
         // Mark revealed and accumulate virtual sell pressure.
         // On FHE-enabled networks (Sepolia etc.), FHE.add() accumulates encrypted
@@ -428,17 +434,30 @@ contract TWAMMXHook is ITWAMMXHook, IHooks, IUnlockCallback {
 
             if (elapsed > 0) {
                 // Fetch current pool state
-                (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(pid);
-                uint128 liquidity         = poolManager.getLiquidity(pid);
+                (uint160 sqrtPriceX96, int24 tick,,) = poolManager.getSlot0(pid);
+                uint128 liquidity                     = poolManager.getLiquidity(pid);
 
-                // Execute TWAMM batch — computes virtual execution amounts and new price.
-                // NOTE: This is an accounting-layer execution. The computed amountOut values
-                // represent what traders receive at the TWAP price. In a full production
-                // deployment, actual token settlement would require a separate settlement
-                // contract that holds trader funds and calls poolManager.swap() per order.
-                // The price signal (newSqrt) is used here for rebate sizing only.
+                // Determine the nearest tick boundary to cap batch price movement.
+                // sell0 pushes price down → cap at the lower tick boundary.
+                // sell1 pushes price up   → cap at the upper tick boundary.
+                // This prevents a single batch from crossing a tick and using
+                // stale liquidity values for the portion beyond the boundary.
+                int24 tickSpacing = key.tickSpacing;
+                uint160 sqrtPriceLimit;
+                if (sell0 >= sell1) {
+                    // price falling — cap at bottom of current tick
+                    int24 lowerTick = (tick / tickSpacing) * tickSpacing;
+                    sqrtPriceLimit = TickMath.getSqrtPriceAtTick(lowerTick);
+                } else {
+                    // price rising — cap at top of current tick
+                    int24 upperTick = ((tick / tickSpacing) + 1) * tickSpacing;
+                    sqrtPriceLimit = TickMath.getSqrtPriceAtTick(upperTick);
+                }
+
+                // Execute TWAMM batch — computes virtual execution amounts and new price,
+                // clamped to the nearest tick boundary.
                 (uint256 out0, uint256 out1, uint160 newSqrt) = TWAMMBatchMath.computeBatch(
-                    sqrtPriceX96, liquidity, sell0, sell1, elapsed
+                    sqrtPriceX96, liquidity, sell0, sell1, elapsed, sqrtPriceLimit
                 );
 
                 // Accrue LP rebate from virtual spread

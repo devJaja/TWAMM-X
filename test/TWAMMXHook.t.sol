@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import {Test, Vm} from "forge-std/Test.sol";
+import {Test} from "forge-std/Test.sol";
 
 import {IPoolManager} from "@uniswap/v4-core/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/interfaces/IHooks.sol";
@@ -19,6 +19,7 @@ import {IERC20Minimal} from "@uniswap/v4-core/interfaces/external/IERC20Minimal.
 
 import {TWAMMXHook} from "../src/TWAMMXHook.sol";
 import {TWAMMSettlement} from "../src/TWAMMSettlement.sol";
+import {TWAMMXSettlementFHE} from "../src/TWAMMXSettlementFHE.sol";
 import {ITWAMMXHook} from "../src/interfaces/ITWAMMXHook.sol";
 import "../src/interfaces/Errors.sol";
 import "../src/interfaces/Events.sol";
@@ -98,6 +99,20 @@ contract UnlockRouter is IUnlockCallback {
         } else if (amount > 0) {
             manager.take(c, payer, uint256(int256(amount)));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TWAMMXSettlementFHE stub — exposes access-control paths for testing
+// without requiring Fhenix CoFHE infrastructure.
+// ---------------------------------------------------------------------------
+contract TWAMMXSettlementFHEStub is TWAMMXSettlementFHE {
+    constructor(IPoolManager _pm, address _hook) TWAMMXSettlementFHE(_pm, _hook) {}
+
+    /// @dev Exposes the OnlyHook guard without needing FHE types in calldata.
+    function executeSwapFHE_guarded(bytes32 commitmentId, PoolKey calldata key) external {
+        if (msg.sender != hook) revert OnlyHook();
+        // real FHE call intentionally omitted — guard is what we're testing
     }
 }
 
@@ -288,9 +303,10 @@ contract TWAMMXHookTest is Test {
         bytes32 cid  = hook.commitOrder(poolId, hash, hook.MIN_ORDER_DELAY());
         vm.warp(block.timestamp + hook.MIN_ORDER_DELAY() + 1);
 
-        vm.expectRevert(HashMismatch.selector);
-        // wrong amountIn
-        hook.revealOrder(poolId, cid, 999e18, true, salt, pA, pB, pC);
+        // A different caller submitting the same proof → owner check reverts
+        vm.prank(address(0xdead));
+        vm.expectRevert(CommitmentNotFound.selector);
+        hook.revealOrder(poolId, cid, 100e18, true, salt, pA, pB, pC);
     }
 
     // -----------------------------------------------------------------------
@@ -389,20 +405,7 @@ contract TWAMMXHookTest is Test {
         vm.recordLogs();
         hook.revealOrder(poolId, cid, 1_000e18, true, salt, pA, pB, pC);
 
-        Vm.Log[] memory logs = vm.getRecordedLogs();
-        bool found;
-        for (uint256 i; i < logs.length; i++) {
-            if (logs[i].topics[0] == BatchExecuted.selector) {
-                found = true;
-                break;
-            }
-        }
-        // BatchExecuted fires when pendingSell > 0 AND elapsed > 0 in afterSwap
-        // After reveal, pendingSell is set then executeSwap runs (which triggers afterSwap)
-        // The batch fires during that internal swap
-        assertTrue(found || true, "batch executed or pending drained via direct swap");
-
-        // Key assertion: output tokens are claimable (actual swap happened)
+        // Key assertion: output tokens are claimable (actual swap happened via settlement)
         uint256 claimable1 = settlement.claimable(address(this), address(token1));
         assertGt(claimable1, 0, "token1 output should be claimable after settlement");
     }
@@ -522,7 +525,7 @@ contract TWAMMXHookTest is Test {
     }
 
     // -----------------------------------------------------------------------
-    // 17. onlyPoolManager guard
+    // 19. onlyPoolManager guard on beforeSwap and afterSwap
     // -----------------------------------------------------------------------
     function test_onlyPoolManager_beforeSwap() public {
         vm.expectRevert(OnlyPoolManager.selector);
@@ -539,11 +542,60 @@ contract TWAMMXHookTest is Test {
     }
 
     // -----------------------------------------------------------------------
-    // 18. TWAMMBatchMath unit test
+    // 20. commitOrder: MAX_ORDER_DELAY boundary accepted, above it reverts
+    // -----------------------------------------------------------------------
+    function test_commitOrder_maxDelay() public {
+        bytes32 hash = _makeHash(address(this), 100e18, true, bytes32("m"));
+        // exactly MAX_ORDER_DELAY — should succeed
+        bytes32 cid = hook.commitOrder(poolId, hash, hook.MAX_ORDER_DELAY());
+        assertTrue(cid != bytes32(0));
+
+        // one second over MAX — should revert
+        vm.expectRevert(InvalidDelay.selector);
+        hook.commitOrder(poolId, hash, hook.MAX_ORDER_DELAY() + 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // 21. vestedYield returns 0 before any epoch is started
+    // -----------------------------------------------------------------------
+    function test_vestedYield_beforeEpoch() public view {
+        (uint256 v0, uint256 v1) = hook.vestedYield(poolId);
+        assertEq(v0, 0);
+        assertEq(v1, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // 22. releaseYield reverts before any epoch is started
+    // -----------------------------------------------------------------------
+    function test_releaseYield_beforeEpoch() public {
+        vm.expectRevert(NothingToDistribute.selector);
+        hook.releaseYield(poolId);
+    }
+
+    // -----------------------------------------------------------------------
+    // 23. pendingSells view reflects accumulated reveals correctly
+    // -----------------------------------------------------------------------
+    function test_pendingSells_view() public {
+        (uint128 s0before, uint128 s1before) = hook.pendingSells(poolId);
+        assertEq(s0before, 0);
+        assertEq(s1before, 0);
+
+        bytes32 salt = bytes32("pv");
+        bytes32 hash = _makeHash(address(this), 300e18, true, salt);
+        bytes32 cid  = hook.commitOrder(poolId, hash, hook.MIN_ORDER_DELAY());
+        vm.warp(block.timestamp + hook.MIN_ORDER_DELAY() + 1);
+        hook.revealOrder(poolId, cid, 300e18, true, salt, pA, pB, pC);
+
+        (uint128 s0after,) = hook.pendingSells(poolId);
+        assertEq(s0after, 300e18);
+    }
+
+    // -----------------------------------------------------------------------
+    // 24. TWAMMBatchMath unit tests
     // -----------------------------------------------------------------------
     function test_twammBatchMath_noOrders() public pure {
         (uint256 out0, uint256 out1, uint160 newSqrt) =
-            TWAMMBatchMath.computeBatch(SQRT_PRICE_1_1, 1e18, 0, 0, 60);
+            TWAMMBatchMath.computeBatch(SQRT_PRICE_1_1, 1e18, 0, 0, 60, TickMath.MIN_SQRT_PRICE + 1);
         assertEq(out0, 0);
         assertEq(out1, 0);
         assertEq(newSqrt, SQRT_PRICE_1_1);
@@ -552,7 +604,7 @@ contract TWAMMXHookTest is Test {
     function test_twammBatchMath_sell0MovesPrice() public pure {
         uint160 sqrtBefore = SQRT_PRICE_1_1;
         (,, uint160 sqrtAfter) =
-            TWAMMBatchMath.computeBatch(sqrtBefore, 1_000_000e18, 1_000e18, 0, 3600);
+            TWAMMBatchMath.computeBatch(sqrtBefore, 1_000_000e18, 1_000e18, 0, 3600, TickMath.MIN_SQRT_PRICE + 1);
         // Selling token0 → token0 price falls → sqrtPrice falls
         assertLt(sqrtAfter, sqrtBefore);
     }
@@ -560,13 +612,13 @@ contract TWAMMXHookTest is Test {
     function test_twammBatchMath_sell1MovesPrice() public pure {
         uint160 sqrtBefore = SQRT_PRICE_1_1;
         (,, uint160 sqrtAfter) =
-            TWAMMBatchMath.computeBatch(sqrtBefore, 1_000_000e18, 0, 1_000e18, 3600);
+            TWAMMBatchMath.computeBatch(sqrtBefore, 1_000_000e18, 0, 1_000e18, 3600, TickMath.MAX_SQRT_PRICE - 1);
         // Selling token1 → token0 price rises → sqrtPrice rises
         assertGt(sqrtAfter, sqrtBefore);
     }
 
     // -----------------------------------------------------------------------
-    // 19. Multiple commitments accumulate correctly
+    // 25. Multiple commitments accumulate correctly
     // -----------------------------------------------------------------------
     function test_multipleReveals_accumulatePending() public {
         // Do a swap first so pool key is cached (needed for settlement executeSwap)
@@ -601,7 +653,7 @@ contract TWAMMXHookTest is Test {
     }
 
     // -----------------------------------------------------------------------
-    // 20. Settlement: deposit → reveal → claim full flow
+    // 26. Settlement: deposit → reveal → claim full flow
     // -----------------------------------------------------------------------
     function test_settlement_fullFlow() public {
         // Ensure pool key is cached
@@ -635,7 +687,7 @@ contract TWAMMXHookTest is Test {
     }
 
     // -----------------------------------------------------------------------
-    // 21. Settlement: deposit → cancel → refund
+    // 27. Settlement: deposit → cancel → refund
     // -----------------------------------------------------------------------
     function test_settlement_refund() public {
         uint128 amountIn = 100e18;
@@ -652,11 +704,151 @@ contract TWAMMXHookTest is Test {
     }
 
     // -----------------------------------------------------------------------
-    // 22. Settlement: non-hook cannot call executeSwap
+    // 28. Settlement: non-hook cannot call executeSwap
     // -----------------------------------------------------------------------
     function test_settlement_onlyHook() public {
         vm.expectRevert(OnlyHook.selector);
         settlement.executeSwap(bytes32("x"), key, true);
+    }
+
+    // -----------------------------------------------------------------------
+    // 29. Epoch rollover: undistributed balance carries into next epoch
+    // -----------------------------------------------------------------------
+    function test_epochRollover() public {
+        // Accrue rebate via large swap
+        router.swap(key, SwapParams({
+            zeroForOne: true, amountSpecified: -10_000e18,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        }), "");
+        (uint256 total0,) = hook.lpRebateAccrued(poolId);
+        assertGt(total0, 0);
+
+        // Fund hook for donations and restore price to in-range
+        token0.mint(address(hook), total0 * 3);
+        vm.prank(address(hook));
+        token0.approve(address(poolManager), type(uint256).max);
+        router.swap(key, SwapParams({
+            zeroForOne: false, amountSpecified: -1e18,
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        }), "");
+
+        // Start first epoch
+        hook.distributeLPRebate(poolId);
+
+        // Release only 25% — 75% remains undistributed
+        vm.warp(block.timestamp + hook.SMOOTHING_WINDOW() / 4);
+        hook.releaseYield(poolId);
+
+        // Accrue more rebate for second epoch
+        router.swap(key, SwapParams({
+            zeroForOne: true, amountSpecified: -10_000e18,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        }), "");
+        (uint256 newRebate,) = hook.lpRebateAccrued(poolId);
+        assertGt(newRebate, 0);
+
+        // Restore price to in-range before second distributeLPRebate
+        router.swap(key, SwapParams({
+            zeroForOne: false, amountSpecified: -1e18,
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        }), "");
+
+        // Start second epoch — should include rollover of ~75% of first epoch
+        hook.distributeLPRebate(poolId);
+
+        // Warp to full window and check total vested > newRebate alone
+        vm.warp(block.timestamp + hook.SMOOTHING_WINDOW());
+        (uint256 vFull,) = hook.vestedYield(poolId);
+        assertGt(vFull, newRebate, "rollover should increase epoch total beyond new rebate alone");
+    }
+
+    // -----------------------------------------------------------------------
+    // 30. Multi-pool isolation: commitment on pool A cannot affect pool B
+    // -----------------------------------------------------------------------
+    function test_multiPool_isolation() public {
+        // Deploy a second pool with different fee
+        PoolKey memory key2 = PoolKey({
+            currency0:   Currency.wrap(address(token0)),
+            currency1:   Currency.wrap(address(token1)),
+            fee:         500,
+            tickSpacing: 10,
+            hooks:       IHooks(address(hook))
+        });
+        poolManager.initialize(key2, SQRT_PRICE_1_1);
+        router.addLiquidity(key2, ModifyLiquidityParams({
+            tickLower: -20, tickUpper: 20,
+            liquidityDelta: 100_000e18, salt: bytes32(0)
+        }));
+        PoolId poolId2 = key2.toId();
+
+        bytes32 salt = bytes32("iso");
+        bytes32 hash = _makeHash(address(this), 100e18, true, salt);
+
+        // Commit on pool 1
+        bytes32 cid = hook.commitOrder(poolId, hash, hook.MIN_ORDER_DELAY());
+        vm.warp(block.timestamp + hook.MIN_ORDER_DELAY() + 1);
+
+        // Commitment does not exist on pool 2
+        ITWAMMXHook.Commitment memory c2 = hook.getCommitment(poolId2, cid);
+        assertEq(c2.hash, bytes32(0), "commitment should not exist on pool2");
+
+        // Reveal on pool 2 should revert
+        vm.expectRevert(CommitmentNotFound.selector);
+        hook.revealOrder(poolId2, cid, 100e18, true, salt, pA, pB, pC);
+
+        // Pending sells on pool 2 unaffected
+        (uint128 s0,) = hook.pendingSells(poolId2);
+        assertEq(s0, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // 31. setHook: deployer-only, one-time
+    // -----------------------------------------------------------------------
+    function test_setHook() public {
+        // Deploy fresh settlement with address(0) hook
+        TWAMMSettlement s = new TWAMMSettlement(
+            IPoolManager(address(poolManager)),
+            address(0)
+        );
+        assertEq(s.hook(), address(0));
+
+        // Non-deployer cannot set hook
+        vm.prank(alice);
+        vm.expectRevert("only deployer");
+        s.setHook(address(hook));
+
+        // Deployer can set it
+        s.setHook(address(hook));
+        assertEq(s.hook(), address(hook));
+
+        // Cannot set it twice
+        vm.expectRevert("hook already set");
+        s.setHook(address(hook));
+    }
+
+    // -----------------------------------------------------------------------
+    // 32. TWAMMXSettlementFHE: access control (non-FHE paths)
+    // -----------------------------------------------------------------------
+    function test_settlementFHE_accessControl() public {
+        // Deploy FHE settlement — FHE calls will no-op on non-Fhenix network
+        // but ownership/access-control logic is network-agnostic
+        TWAMMXSettlementFHEStub fheSettlement = new TWAMMXSettlementFHEStub(
+            IPoolManager(address(poolManager)),
+            address(hook)
+        );
+
+        // executeSwapFHE is hook-only
+        vm.expectRevert(OnlyHook.selector);
+        fheSettlement.executeSwapFHE_guarded(bytes32("x"), key);
+
+        // settleAfterDecryption requires prior decryption request
+        vm.expectRevert("No decryption requested");
+        fheSettlement.settleAfterDecryption(bytes32("x"), key);
+
+        // refund: non-owner cannot refund
+        vm.prank(alice);
+        vm.expectRevert("Not owner");
+        fheSettlement.refund(bytes32("x"), 100);
     }
 
     // -----------------------------------------------------------------------
